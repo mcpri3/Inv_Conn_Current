@@ -1,0 +1,504 @@
+---
+title: "P1_Data_Clean"
+author: "mtzivano"
+date: "2023-04-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Clean Arthropod Data from GBIF and other sources
+
+For each of the taxonomic groups included in the project, data are assembled and cleaned to enter the modeling pipeline. This cleaning procedure incudes the following steps:
+
+* Aggregate data from different sources
+* Resolve potential taxonomic issues
+* Ensure that datasets are not overlapping
+* Remove suspect records using CoordinateCleaner
+* Rasterize on grid
+* Report on summary statistics for the group, including number of species, number of records initially and after each cleaning step, maps of sampling effort/species richness and environmental coverage of observations
+
+### Setup
+
+```{r include=FALSE}
+# Libraries
+library(stringr)
+library(data.table)
+library(raster)
+library(terra)
+library(tidyverse)
+library(countrycode)
+library(CoordinateCleaner)
+library(ggplot2)
+library(progress)
+```
+
+```{r}
+# Source functions
+source("C:/Users/tzivanom/Documents/Scripts/Functions/F1_CleanData_FUNCTIONS.R")
+
+# Paths
+path_species_data <- "D:/GBIF_INVERTEBRATE_RAW/GBIF_extracted_data/"
+path_GIS_data <- "C:/Users/tzivanom/Documents/Data/GIS/"
+path_save <- "D:/PostFiltering/GBIF_only/"
+path_save_obs <- "D:/PostFiltering/OBSorg_only/"
+path_final <- "D:/PostFiltering/Final_Rasters_AllData/"
+path_results <- "C:/Users/tzivanom/Documents/Results/NaturaConnect/DataCleaning/"
+```
+
+```{r}
+# References
+
+# NaturaConnect raster template
+NaturaConnect_grid1k <- raster(paste0(path_GIS_data, "BIOCLIMP_NC/EUR11_1991-2020.tif"))[[1]]
+NaturaConnect_grid_r <- rast(NaturaConnect_grid1k)
+values(NaturaConnect_grid_r) <- NA
+
+# EUROSTAT country references
+EUROSTAT_Countries_1k <- shapefile(paste0(path_GIS_data, "CountryBorders_EUROSTAT/EUROSTAT_Countries_buffered1k_WGS84.shp"))
+```
+
+
+```{r}
+# Group variables
+taxo_groups_all <- c("Insecta/Coleoptera/Carabidae",
+                     "Insecta/Hymenoptera/Formicidae",
+                     "Arachnida/Araneae",
+                     "Gastropoda",
+                     "Insecta/Odonata",
+                     "Insecta/Hymenoptera/Ichneumonoidea",
+                     "Insecta/Lepidoptera/Heterocera",
+                     "Insecta/Orthoptera",
+                     "Collembola",
+                     "Clitellata/Crassiclitellata",
+                     "Insecta/Lepidoptera/Rhopalocera",
+                     "Insecta/Diptera/Syrphidae",
+                     "Insecta/Hymenoptera/Anthophila")
+
+taxo_groups_gbif <- taxo_groups_all[!taxo_groups_all %in% c("Insecta/Lepidoptera/Rhopalocera",
+                                                            "Insecta/Diptera/Syrphidae",
+                                                            "Insecta/Hymenoptera/Anthophila")]
+```
+
+### Standard filters
+
+During data cleaning there are processing steps that are applied in the same way to all taxonomic groups. These include filtering by coordinate precision, applying CoordinateCleaner tests and sampling points on a grid. We can combine all these steps into a single function that is applied to every species in each taxonomic groups. 
+
+The filtering tables returned by the function can be combined to a single dataframe to rasterize and create maps of sampling effort and species richness after filtering. The final rasters will be the inputs of SDMs and can also be used to derive maps of species richness after data cleaning. Finally, we extract a summary table of the number of records removed at each steps which will help us validate the results of the function.
+
+Tables of sampling effort and species richness are useful because they will help us identify the presence of sampling biases in space.
+
+After gridding, we only have one observation per species by raster cell, so we can create species richness maps and see if the spatial pattern of bias has changed. Because there can be many species (and thus rasters) for a given taxonomic group, we will add the layers through a loop
+
+```{r}
+# Loop by taxonomic group
+for (i in 1:length(taxo_groups_gbif)){
+  
+  # Get files
+  group_i <- str_split_1(taxo_groups_gbif[i], "/")[length(str_split_1(taxo_groups_gbif[i], "/"))]
+  dir.create(paste0(path_save, group_i))
+  dir.create(paste0(path_save, group_i, "/Species_rasters"))
+  tables_all <- list.files(paste0(path_species_data, taxo_groups_gbif[i]), 
+                        pattern = ".csv", recursive = TRUE, full.names = TRUE)
+
+  cat(paste("Starting with:", group_i, "\n"))
+  cat("Applying standard filters")
+  
+  # Apply standard filters  
+  # Save outputs
+  tables_prec <- list()
+  cleaning_report <- list()
+
+  # Progress
+  prbar <- progress_bar$new(format = "(:spin) [:bar] :percent [Elapsed: :elapsedfull || Remaining: :eta]",
+                         total = length(tables_all),
+                         complete = "=", incomplete = "-", current = ">", clear = FALSE, width = 100)     
+
+
+  for (species in 1:length(tables_all)){
+  
+    prbar$tick()
+  
+    # Read
+    temp <- read.csv(tables_all[species], header = TRUE, encoding = "utf-8")
+    
+    # Remove gridded datasets from WUR provider
+    temp <- temp[which(temp$institutionCode != "WUR-Alterra" |
+                         is.na(temp$institutionCode)), ]
+    
+    # Apply standard filters
+    # Filter for precision, coordinates and grid
+    filter_result <- suppressWarnings(standard_filters(temp, template_raster = NaturaConnect_grid1k,
+                                      precision = 1000, clean_coords = TRUE, clean_dataset = FALSE, on_grid = TRUE,
+                                      outputs = c("summary", "table_prec", "final_rasters"),
+                                      
+                                      # CoordinateCleaner function arguments
+                                      species = "species", seas_ref = EUROSTAT_Countries_1k,
+                                      tests = c("equal","gbif", "institutions", "zeros", "seas")))
+    
+    # Retrieve outputs
+    species_i <- sub(".csv", ".tif",
+                     str_split_1(tables_all[species],"/")[length(str_split_1(tables_all[species], "/"))])
+    tables_prec[[species]] <- filter_result[[1]]
+    cleaning_report[[species]] <- filter_result[[3]]
+    writeRaster(filter_result[[2]], paste0(path_save, group_i, "/Species_rasters/", species_i),
+                overwrite = TRUE)
+   
+  }  
+  
+  cat("Now processing output files...\n")
+  
+  # Create summary dataframe
+  cleaning_report_df <- map_df(cleaning_report, ~as.data.frame(t(.)))
+  colnames(cleaning_report_df) <- c("Start", "Precision", "CC_coords", "CC_data", "Grid", "End")
+  cleaning_report_df$File <- tables_all
+
+  # Save
+  write.csv(cleaning_report_df, paste0(path_save, group_i, "/", group_i, "_CleaningSummary.csv"), 
+            row.names = FALSE)
+  
+  # Create maps of sampling effort and species richness in Europe
+
+  # Combine all filtering tables to a single data.frame
+  all_pfiltering <- do.call("rbind", tables_prec)
+
+  # Convert to spatial format and reproject to NaturaConnect grid
+  all_pfiltering_sp <- vect(all_pfiltering, 
+                        geom = c("decimalLongitude", "decimalLatitude"), 
+                        crs = "+proj=longlat +datum=WGS84 +no_defs +type=crs", keepgeom = FALSE)
+    
+  all_pfiltering_sp <- terra::project(all_pfiltering_sp, NaturaConnect_grid_r)
+  
+  # Sampling effort: count the number of observations by cell
+  sampling_effort_filt <- rasterize(all_pfiltering_sp, NaturaConnect_grid_r, field = "species", fun = length, background = NA)
+  
+  # Species richness: count the number of unique species by cell
+  species_richness_filt <- rasterize(all_pfiltering_sp, NaturaConnect_grid_r, field = "species", fun = spec_richness, background = NA)
+  
+  # Save
+  write.csv(all_pfiltering, paste0(path_save, group_i, "/", group_i, "_GroupObs_AfterFilt.csv"),
+            row.names = FALSE)
+  writeRaster(sampling_effort_filt, paste0(path_save, group_i, "/", group_i, "_SamplingEffort_AfterFilt.tif"))
+  writeRaster(species_richness_filt, paste0(path_save, group_i, "/", group_i, "_SpeciesRichness_AfterFilt.tif"))
+  
+}
+```
+
+### Observation.org data cleaning
+
+Ideally we would add our observation.org data to our GBIF data and clean once. However, because a few observations in the observations.org dataset are flagged as do not display at high resolution, we need to be able to differentiate the rasters produced from the two. Observation.org rasters will be saved separately and added to the GBIF rasters before the modelling part
+
+```{r}
+# Define groups for which we have data
+obs_taxo_groups <- taxo_groups_gbif[-which(taxo_groups_gbif %in% c("Collembola", "Clitellata/Crassiclitellata",
+                                                                   "Insecta/Orthoptera"))]
+
+# Load observation.org filtered data
+obs_org_filtered <- fread("D:/Observations_ORG/Filtered_Dataset_P0/ObservationOrg_Filtered_Data.csv")
+
+# Loop through taxonomic groups
+for (i in 1:length(obs_taxo_groups)){
+  
+  # Get species files
+  group_i <- str_split_1(obs_taxo_groups[i], "/")[length(str_split_1(obs_taxo_groups[i], "/"))]
+  dir.create(paste0(path_save_obs, group_i))
+  dir.create(paste0(path_save_obs, group_i, "/Species_rasters"))
+  tables_all <- list.files(paste0(path_species_data, obs_taxo_groups[i]), 
+                        pattern = ".csv", recursive = TRUE, full.names = TRUE)
+
+  cat(paste("Starting with:", group_i, "\n"))
+  cat("Applying standard filters")
+  
+  # Apply standard filters  
+  # Save outputs
+  k <- 1
+  cleaning_report <- list()
+  tables_prec <- list()
+  file_name <- c()
+  obs_start <- rep(0, length(tables_all))
+  is_obscure_at <- rep(0, length(tables_all))
+
+  # Progress
+  prbar <- progress_bar$new(format = "(:spin) [:bar] :percent [Elapsed: :elapsedfull || Remaining: :eta]",
+                         total = length(tables_all),
+                         complete = "=", incomplete = "-", current = ">", clear = FALSE, width = 100)     
+
+
+  for (species in 1:length(tables_all)){
+  
+    prbar$tick()
+  
+    # Read
+    temp <- read.csv(tables_all[species], header = TRUE, encoding = "utf-8")
+    
+    # Keep observation.org records with a precision > 1 km in GBIF (others retained previously)
+    temp <- temp[temp$datasetKey == "8a863029-f435-446a-821e-275f4f641165" & temp$coordinateUncertaintyInMeters > 1000, ]
+
+    # Skip if no records
+    if (!check_rows(temp)){next}
+    obs_start[species] <- nrow(temp)
+    
+    # Match record IDs and retrieve high resolution coordinates and new precision values
+    obstemp <- obs_org_filtered[link %in% temp$occurrenceID, c("naam_lat", "latitude", 
+                                                               "longitude", "precision", 
+                                                               "link", "obscure")]
+    is_obscure_at[species] <- obstemp$obscure[1]
+    temp <- merge(temp, obstemp, by.x = "occurrenceID", by.y = "link")
+    if (!check_rows(temp)){next}
+    
+    # Apply standard filters
+    # Filter for precision, coordinates and grid
+    file_name[k] <- tables_all[species]
+    filter_result <- suppressWarnings(standard_filters(temp, template_raster = NaturaConnect_grid1k,
+                                      precision = 1000, precision_col = "precision",
+                                      lon = "longitude", lat = "latitude",
+                                      clean_coords = TRUE, clean_dataset = FALSE, on_grid = TRUE,
+                                      outputs = c("summary", "table_prec", "final_rasters"),
+                                      
+                                      # CoordinateCleaner function arguments
+                                      species = "species", seas_ref = EUROSTAT_Countries_1k,
+                                      tests = c("equal","gbif", "institutions", "zeros", "seas")))
+    
+    # Retrieve outputs
+    species_i <- sub("\\.csv", "_OBSORG.tif", 
+                     str_split_1(tables_all[species], "/")[length(str_split_1(tables_all[species], "/"))])
+    tables_prec[[k]] <- filter_result[[1]]
+    cleaning_report[[k]] <- filter_result[[3]]
+    writeRaster(filter_result[[2]], paste0(path_save_obs, group_i, "/Species_rasters/", species_i),
+                overwrite = TRUE)
+    
+    k <- k + 1
+   
+  }  
+  
+  cat("Now processing output files...\n")
+  
+  # Create summary dataframe
+  cleaning_report_df <- map_df(cleaning_report, ~as.data.frame(t(.)))
+  colnames(cleaning_report_df) <- c("Obs_matched", "Precision", "CC_coords", "CC_data", "Grid", "End")
+  cleaning_report_df$file_name <- file_name
+  obs_report <- data.frame(Start = obs_start, obscure = is_obscure_at, name = tables_all)
+  cleaning_report_df <- merge(obs_report, cleaning_report_df, 
+                              by.x = "name", by.y= "file_name", all.x = TRUE)
+  write.csv(cleaning_report_df, 
+            paste0(path_save_obs, group_i, "/", group_i, "_CleaningSummary_OBSORG.csv"), row.names = FALSE)
+  
+  # Save cleaned observations and sampling effort
+  all_pfiltering <- do.call("rbind", tables_prec)
+  all_pfiltering_sp <- vect(all_pfiltering, 
+                        geom = c("longitude", "latitude"), 
+                        crs = "+proj=longlat +datum=WGS84 +no_defs +type=crs", keepgeom = FALSE)
+  all_pfiltering_sp <- terra::project(all_pfiltering_sp, NaturaConnect_grid_r)
+  sampling_effort_filt <- rasterize(all_pfiltering_sp, NaturaConnect_grid_r, 
+                                    field = "species", fun = length, background = NA)
+  species_richness_filt <- rasterize(all_pfiltering_sp, NaturaConnect_grid_r, 
+                                     field = "species", fun = spec_richness, background = NA)
+  write.csv(all_pfiltering, paste0(path_save_obs, group_i, "/", group_i, "_GroupObs_AfterFilt_OBSORG.csv"),
+            row.names = FALSE)
+  writeRaster(sampling_effort_filt, 
+              paste0(path_save_obs, group_i, "/", group_i, "_SamplingEffort_AfterFilt_OBSORG.tif"))
+  writeRaster(species_richness_filt, 
+              paste0(path_save_obs, group_i, "/", group_i, "_SpeciesRichness_AfterFilt_OBSORG.tif"))
+  
+  }
+```
+
+## Adding information on the species' origin
+
+Because GBIF data are extracted using a range including parts if north Africa and west Asia, some of the species in the GBIF downloads may not be European species. We can find the number of observations in the EU+ study area to calculate the percentage of non-EU observations using the raster layers out putted for each species.
+
+For our EU+ extent we can use Yue's land-use map. then we go through our species layers and count the number of pixels retained after masking.
+
+We can also assess the number of observations by species located in urban areas or freshwater covered areas that do not have soil data available.
+
+Finally, we can find the number of observations of each species in Ireland and England as we will use these areas to create a fake evaluation set for selecting our PA set.
+
+```{r}
+# Load land-use layer
+EUp_zones <- rast(paste0(path_GIS_data, "LandUse/LandCover_Yue_WithConiferousForest.tif"))
+
+# Convert 0s to NAs
+EUp_zones[EUp_zones <= 0] <- NA
+
+# Extend to NaturaConncet extent
+EUp_zones <- terra::extend(EUp_zones, NaturaConnect_grid_r)
+
+# Mask grid raster
+EUp_zones <- mask(rast(NaturaConnect_grid1k), EUp_zones)
+EUp_zones[!is.na(EUp_zones)] <- 1
+```
+
+```{r}
+# Load  soil layer
+soil_data <- rast(paste0(path_GIS_data, "Prepped_layers/VarPart_V/Soil_Variables_All.tif"))[["phh2o"]]
+soil_data[soil_data > 0] <- 1
+soil_data[soil_data <= 0] <- NA
+```
+```{r}
+# Load Ireland and UK polygon (extracted from EUROSTAT)
+IE_UK_poly <- project(vect(paste0(path_GIS_data, 
+                                  "CountryBorders_EUROSTAT/EUROSTAT_IrelandUK_buffered1k_WGS84.shp")), NaturaConnect_grid_r)
+IE_UK_rast <- rasterize(IE_UK_poly, NaturaConnect_grid_r, field = "FID", background = NA)
+```
+
+
+Get final rasters and find number of final observations by species, observations in the EU and observations with available soil data
+
+```{r}
+for (i in 1:length(taxo_groups_all)){
+  
+  # Get species
+  group_i <- str_split_1(taxo_groups_all[i], "/")[length(str_split_1(taxo_groups_all[i], "/"))]
+  group_species <- list.files(paste0(path_save, group_i, "/Species_rasters/"))
+  cat(paste0("Starting with: ", group_i, "\n"))
+  
+  # Prepare summary data frame
+  cleaned_obs <- rep(0, length(group_species))
+  EUp_obs <- rep(0, length(group_species))
+  soil_obs <- rep(0, length(group_species))
+  IEUK_obs <- rep(0, length(group_species))
+  
+  # Progress bar
+  prbar <- progress_bar$new(format = "(:spin) [:bar] :percent [Elapsed: :elapsedfull || Remaining: :eta]",
+                            total = length(group_species),
+                            complete = "=", incomplete = "-", current = ">", clear = FALSE, width = 100)
+  
+  # Create directories
+  dir.create(paste0(path_final, group_i, "/Species_rasters"), recursive = TRUE)
+  
+  # Combine all species rasters
+  for (species in 1:length(group_species)){
+    
+    prbar$tick()
+    species_i <- sub("\\.tif", "", group_species[species])
+    
+    # Read species raster
+    species_raster <- combine_rasters(paste0(group_i, "/Species_rasters/", species_i),
+                                      NaturaConnect_grid_r, fun = "max") 
+    # Number of final observations 
+    cleaned_obs[species] <- global(species_raster, fun = "sum", na.rm = TRUE)[1, 1]
+    
+    # Mask with EUp
+    species_raster_EU <- mask(species_raster, EUp_zones, maskvalues = NA)
+    
+    # Number of EU observations
+    EUp_obs[species] <- global(species_raster_EU, fun = "sum", na.rm = TRUE)[1, 1] 
+    
+    # Mask with available soil data
+    species_raster_soil <- mask(species_raster, soil_data, maskvalues = NA)
+    
+    # Number of observations with soil data available
+    soil_obs[species] <- global(species_raster_soil, fun = "sum", na.rm = TRUE)[1, 1]
+    
+    # Mask with Ireland  UK
+    species_raster_IEUK <- mask(species_raster, IE_UK_rast, maskvalues = NA)
+    
+    # Number of observations in Ireland & the UK
+    IEUK_obs[species] <- global(species_raster_IEUK, fun = "sum", na.rm = TRUE)[1, 1]
+    
+    # Write final species raster
+    ifelse(is.na(cleaned_obs[species]), next, 
+           writeRaster(species_raster, 
+                       paste0(path_final, group_i, "/Species_rasters/", species_i, ".tif")))
+    
+  }
+  
+  # Save group df results
+  group_results <- data.frame(Species = sub("\\.tif", "", group_species), 
+                              All = cleaned_obs, 
+                              EUp = EUp_obs,
+                              Soil = soil_obs,
+                              IEUK = IEUK_obs)
+  
+  write.csv(group_results, paste0(path_results, "SummarypostEUP/", group_i, "_FilteringResults.csv"), 
+            row.names = FALSE)
+  
+  # Get sum of sampling effort
+  sampling_effort <- combine_rasters(paste0(group_i, "/", group_i, "_SamplingEffort_AfterFilt"),
+                                     NaturaConnect_grid_r, fun = "sum")
+  
+  # Path to output
+  output_path <- paste0(path_final, group_i, "/", group_i, "_SamplingEffort_All.tif")
+  
+  # Deal with bees and wasps
+  writeRaster(sampling_effort, output_path)
+  
+  
+}
+```
+
+
+
+
+```{r}
+# Species lists for NaturaConnect
+# Read final list of species by group
+taxo_groups_new <- c("Anthophila", "Araneae", "Carabidae", "Formicidae", "Orthoptera", "Odonata", "Lepidoptera",
+                     "Gastropoda", "Ichneumonoidea", "Syrphidae", "Crassiclitellata", "Collembola")
+
+for (i in 1:length(taxo_groups_new)){
+  
+  # Read summary file, for bees and wasps we will need to merge the tables for all fmilies
+  if (taxo_groups_new[i] == "Anthophila"){
+    
+    all_dfs <- list()
+    families <- c("Andrenidae", "Halictidae", "Colletidae", "Apidae", "Melittidae", "Megachilidae")
+    for (f in 1:length(families)){
+      
+      all_dfs[[f]] <- read.csv(paste0(path_results, "SummarypostEUP/", families[f], "_cleaning_end_obs.csv"),
+                                 header = TRUE)
+      all_dfs[[f]]$Group <- rep(families[f], nrow(all_dfs[[f]]))
+      
+    }
+    
+    tmp <- do.call("rbind", all_dfs)
+    
+  } else if (taxo_groups_new[i] == "Ichneumonoidea"){
+    
+    all_dfs <- list()
+    families <- c("Braconidae", "Ichneumonidae")
+    for (f in 1:length(families)){
+      
+      all_dfs[[f]] <- read.csv(paste0(path_results, "SummarypostEUP/", families[f], "_cleaning_end_obs.csv"),
+                                 header = TRUE)
+      all_dfs[[f]]$Group <- rep(families[f], nrow(all_dfs[[f]]))
+      
+    }
+    
+    tmp <- do.call("rbind", all_dfs)
+
+    
+  } else {
+    
+      tmp <- read.csv(paste0(path_results, "SummarypostEUP/", taxo_groups_new[i], "_cleaning_end_obs.csv"),
+                                 header = TRUE)
+      
+      tmp$Group <- rep(taxo_groups_new[i], nrow(tmp))
+    
+  }
+  
+  tmp[is.na(tmp)] <- 0
+  tmp <- tmp[tmp$All >= 20, c("Species", "Group")]
+  
+  write.csv(tmp, paste0(path_results, "SpeciesLists/27-06-23/", taxo_groups_new[i], "_species_list.csv"), row.names = FALSE)
+  
+}
+
+# All species for selected groups
+sel_taxa <- c("Araneae", "Carabidae", "Formicidae", "Orthoptera", "Odonata", 
+              "Lepidoptera", "Gastropoda", "Syrphidae")
+
+all_species <- list()
+
+for (i in 1:length(sel_taxa)){
+  
+  all_species[[i]] <- read.csv(paste0(path_results, "SpeciesLists/27-06-23/", sel_taxa[i], "_species_list.csv"), header = TRUE)
+  
+}
+
+all_species <- do.call("rbind", all_species)
+write.csv(all_species, paste0(path_results, "SpeciesLists/27-06-23/Provisional_invertebrate_species_list.csv"), row.names = FALSE)
+```
+
